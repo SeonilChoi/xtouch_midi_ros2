@@ -92,6 +92,10 @@ To use another motor config:
 ros2 launch xtouch_midi xtouch_node.launch.py config_file:=/absolute/path/to/config.yaml
 ```
 
+Motor command mapping starts from the physical fader channel set by
+`kChannelOffset` in `xtouch_node.cpp`. The current default maps physical `ch6`
+to controller index `0`, `ch7` to controller index `1`, and so on.
+
 ## Verify
 
 In another terminal:
@@ -106,7 +110,8 @@ ros2 topic echo /xtouch/touch/ch0
 ```
 
 Move the first fader. The node maps fader channel `chN` to controller index
-`N` from the YAML config.
+`N - kChannelOffset` from the YAML config. Raw `/xtouch/fader/chN` and
+`/xtouch/touch/chN` topics keep using the physical X-Touch channel number.
 
 ## Troubleshooting
 

@@ -21,6 +21,10 @@ constexpr int32_t kFaderValueMax = 16383;
 constexpr auto kCommandPublishTick = std::chrono::milliseconds(20);
 constexpr auto kDebounceInterval = std::chrono::milliseconds(100);
 constexpr auto kDebounceTick = std::chrono::milliseconds(50);
+constexpr std::size_t kChannelOffset = 6;
+static_assert(
+  kChannelOffset < kNumChannels,
+  "kChannelOffset must be less than kNumChannels.");
 
 constexpr uint16_t kCwNewSetPointZeroerr = 0x103F;
 constexpr uint16_t kCwNewSetPointMinas = 0x003F;
@@ -140,8 +144,9 @@ XTouchNode::XTouchNode(const rclcpp::NodeOptions & options)
   RCLCPP_INFO(
     get_logger(),
     "xtouch_node ready. Loaded %zu controller(s) from '%s'; publishing "
-    "MotorStatus commands on '%s'.",
-    motor_infos_.size(), config_file.c_str(), command_topic.c_str());
+    "MotorStatus commands on '%s'; channel offset %zu.",
+    motor_infos_.size(), config_file.c_str(), command_topic.c_str(),
+    kChannelOffset);
 }
 
 XTouchNode::~XTouchNode()
@@ -181,6 +186,9 @@ void XTouchNode::on_midi(const std::vector<unsigned char> & bytes)
 
   if (status == 0xE0 && channel < kNumChannels) {
     const int32_t value = static_cast<int32_t>((d2 << 7) | d1);
+    const bool controls_motor =
+      channel >= kChannelOffset &&
+      (channel - kChannelOffset) < motor_infos_.size();
 
     if (publish_raw_topics_ && fader_pubs_[channel]) {
       std_msgs::msg::Int32 m;
@@ -192,7 +200,7 @@ void XTouchNode::on_midi(const std::vector<unsigned char> & bytes)
       std::lock_guard<std::mutex> lk(state_mutex_);
       last_fader_value_[channel] = value;
       fader_value_valid_[channel] = true;
-      if (channel < motor_infos_.size()) {
+      if (controls_motor) {
         motor_command_dirty_ = true;
       }
       debounce_deadline_[channel] =
@@ -239,13 +247,16 @@ void XTouchNode::publish_pending_motor_command()
 
   MotorStatus msg = make_empty_motor_status();
   bool has_target = false;
-  const std::size_t channel_count = std::min(motor_infos_.size(), kNumChannels);
+  const std::size_t available_channels = kNumChannels - kChannelOffset;
+  const std::size_t channel_count =
+    std::min(motor_infos_.size(), available_channels);
   for (std::size_t channel = 0; channel < channel_count; ++channel) {
-    if (!fader_value_valid[channel]) {
+    const std::size_t physical_channel = channel + kChannelOffset;
+    if (!fader_value_valid[physical_channel]) {
       continue;
     }
     has_target = fill_motor_command_target(
-      msg, channel, fader_values[channel]) || has_target;
+      msg, channel, fader_values[physical_channel]) || has_target;
   }
 
   if (has_target) {
