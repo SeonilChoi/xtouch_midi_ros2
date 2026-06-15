@@ -38,6 +38,21 @@ The script installs the apt packages listed in
 `ros2_midi/requirements/apt_packages.txt`, including `librtmidi-dev` and
 `libasound2-dev`. ROS 2 Humble must already be installed.
 
+Add your user to the `audio` group so the node can access ALSA MIDI devices
+without `sudo`:
+
+```bash
+sudo usermod -aG audio $USER
+```
+
+Log out and back in after changing the group membership. To verify it:
+
+```bash
+groups
+```
+
+The output should include `audio`.
+
 Check that the X-Touch is visible to ALSA:
 
 ```bash
@@ -116,6 +131,6 @@ Move the first fader. The node maps fader channel `chN` to controller index
 ## Troubleshooting
 
 - `No MIDI input port matching ...`: check USB power/cable and run `amidi -l`.
-- `Permission denied`: add the user to the `audio` group, then log out and back in:
-  `sudo usermod -aG audio $USER`
+- `Permission denied`: confirm your user is in the `audio` group with `groups`,
+  then log out and back in if it was just added.
 - No `/motor_command` output: the node publishes only when a fader sends MIDI input.
