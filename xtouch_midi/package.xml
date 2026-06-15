@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>xtouch_midi</name>
+  <version>0.1.0</version>
+  <description>
+    ROS 2 bridge for Behringer X-Touch MIDI faders. Publishes raw fader/touch
+    topics and motor_status_msgs/MotorStatus commands for ros2_motor_manager.
+  </description>
+  <maintainer email="seonilchoi98@gmail.com">mini0</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>std_msgs</depend>
+  <depend>motor_status_msgs</depend>
+
+  <build_depend>pkg-config</build_depend>
+  <build_depend>yaml-cpp</build_depend>
+  <exec_depend>yaml-cpp</exec_depend>
+  <depend>librtmidi-dev</depend>
+
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>ros2_motor_manager</exec_depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
