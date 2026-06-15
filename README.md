@@ -17,10 +17,20 @@ It also keeps the raw X-Touch topics available:
 ## Install Dependencies
 
 This package uses the MIDI dependency files from `ros2_midi/requirements`.
-Run this once from the workspace source tree:
+The paths below assume this workspace layout:
+
+```text
+<ws>/src/ros2/xtouch_midi_ros2
+<ws>/src/ros2/ros2_midi
+<ws>/src/ros2/motion_system_ros2
+```
+
+For this machine, `<ws>` is `/home/mini0/colcon_ws`.
+
+Run this once from the ROS 2 source folder:
 
 ```bash
-cd <colcon_ws>/src/ros2
+cd <ws>/src/ros2
 bash ros2_midi/requirements/install_requirements.sh
 ```
 
@@ -41,21 +51,16 @@ The output should include an X-Touch or Behringer MIDI port.
 From the workspace root:
 
 ```bash
-cd <colcon_ws>
+cd <ws>
 source /opt/ros/humble/setup.bash
-colcon build --symlink-install --packages-select motor_status_msgs ros2_motor_manager xtouch_midi
+colcon build --symlink-install \
+  --base-paths src/common src/lib src/ros2/motion_system_ros2 src/ros2/xtouch_midi_ros2/xtouch_midi \
+  --packages-up-to ros2_motor_manager xtouch_midi
 source install/setup.bash
 ```
 
-If the old `ros2_midi/src/xtouch_midi` package is also in the same workspace,
-build only the new package paths to avoid the duplicate `xtouch_midi` package
-name:
-
-```bash
-colcon build --symlink-install \
-  --base-paths src/ros2/motion_system_ros2 src/ros2/xtouch_midi_ros2/xtouch_midi \
-  --packages-select motor_status_msgs ros2_motor_manager xtouch_midi
-```
+The `--base-paths` argument intentionally excludes `src/ros2/ros2_midi/src/xtouch_midi`,
+because that older reference package has the same package name: `xtouch_midi`.
 
 ## Run
 
@@ -63,7 +68,7 @@ Start the motor manager first, or run it in another terminal:
 
 ```bash
 source /opt/ros/humble/setup.bash
-source <colcon_ws>/install/setup.bash
+source <ws>/install/setup.bash
 ros2 launch ros2_motor_manager motor_manager_node.launch.py
 ```
 
@@ -71,14 +76,14 @@ Then start the X-Touch MIDI bridge:
 
 ```bash
 source /opt/ros/humble/setup.bash
-source <colcon_ws>/install/setup.bash
+source <ws>/install/setup.bash
 ros2 launch xtouch_midi xtouch_node.launch.py
 ```
 
 The launch file uses this config by default:
 
 ```text
-ros2_motor_manager/config/example_canopen_zeroerr.yaml
+<ws>/install/ros2_motor_manager/share/ros2_motor_manager/config/example_canopen_zeroerr.yaml
 ```
 
 To use another motor config:
@@ -93,7 +98,7 @@ In another terminal:
 
 ```bash
 source /opt/ros/humble/setup.bash
-source <colcon_ws>/install/setup.bash
+source <ws>/install/setup.bash
 
 ros2 topic echo /motor_command
 ros2 topic echo /xtouch/fader/ch0

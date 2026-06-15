@@ -18,6 +18,7 @@ constexpr std::size_t kNumChannels = 8;
 constexpr uint8_t kFaderTouchNoteStart = 104;
 constexpr uint8_t kFaderTouchNoteEnd = kFaderTouchNoteStart + kNumChannels - 1;
 constexpr int32_t kFaderValueMax = 16383;
+constexpr auto kCommandPublishTick = std::chrono::milliseconds(20);
 constexpr auto kDebounceInterval = std::chrono::milliseconds(100);
 constexpr auto kDebounceTick = std::chrono::milliseconds(50);
 
@@ -129,6 +130,10 @@ XTouchNode::XTouchNode(const rclcpp::NodeOptions & options)
 
   midi_in_->setCallback(&XTouchNode::midi_trampoline, this);
 
+  command_tick_ = create_wall_timer(
+    kCommandPublishTick,
+    std::bind(&XTouchNode::publish_pending_motor_command, this));
+
   debounce_tick_ = create_wall_timer(
     kDebounceTick, std::bind(&XTouchNode::tick_debounce, this));
 
@@ -183,11 +188,13 @@ void XTouchNode::on_midi(const std::vector<unsigned char> & bytes)
       fader_pubs_[channel]->publish(m);
     }
 
-    publish_motor_command(channel, value);
-
     {
       std::lock_guard<std::mutex> lk(state_mutex_);
       last_fader_value_[channel] = value;
+      fader_value_valid_[channel] = true;
+      if (channel < motor_infos_.size()) {
+        motor_command_dirty_ = true;
+      }
       debounce_deadline_[channel] =
         std::chrono::steady_clock::now() + kDebounceInterval;
     }
@@ -213,6 +220,36 @@ void XTouchNode::on_midi(const std::vector<unsigned char> & bytes)
 
     RCLCPP_INFO(get_logger(), "touch[%zu] = %s", ch, touched ? "down" : "up");
     return;
+  }
+}
+
+void XTouchNode::publish_pending_motor_command()
+{
+  std::array<int32_t, kNumChannels> fader_values{};
+  std::array<bool, kNumChannels> fader_value_valid{};
+  {
+    std::lock_guard<std::mutex> lk(state_mutex_);
+    if (!motor_command_dirty_) {
+      return;
+    }
+    fader_values = last_fader_value_;
+    fader_value_valid = fader_value_valid_;
+    motor_command_dirty_ = false;
+  }
+
+  MotorStatus msg = make_empty_motor_status();
+  bool has_target = false;
+  const std::size_t channel_count = std::min(motor_infos_.size(), kNumChannels);
+  for (std::size_t channel = 0; channel < channel_count; ++channel) {
+    if (!fader_value_valid[channel]) {
+      continue;
+    }
+    has_target = fill_motor_command_target(
+      msg, channel, fader_values[channel]) || has_target;
+  }
+
+  if (has_target) {
+    motor_command_pub_->publish(msg);
   }
 }
 
@@ -362,23 +399,23 @@ XTouchNode::MotorStatus XTouchNode::make_empty_motor_status() const
   return msg;
 }
 
-void XTouchNode::publish_motor_command(std::size_t channel, int32_t fader_value)
+bool XTouchNode::fill_motor_command_target(
+  MotorStatus & msg, std::size_t channel, int32_t fader_value)
 {
   if (channel >= motor_infos_.size()) {
     RCLCPP_DEBUG_THROTTLE(
       get_logger(), *get_clock(), 2000,
       "Ignoring fader channel %zu; no controller in config.", channel);
-    return;
+    return false;
   }
 
   const MotorInfo & motor = motor_infos_[channel];
   const std::size_t idx = motor.controller_index;
-  MotorStatus msg = make_empty_motor_status();
 
   if (idx >= msg.controller_index.size()) {
     RCLCPP_WARN(
       get_logger(), "Controller index %zu is outside MotorStatus array.", idx);
-    return;
+    return false;
   }
 
   switch (motor.profile_mode) {
@@ -410,10 +447,10 @@ void XTouchNode::publish_motor_command(std::size_t channel, int32_t fader_value)
         get_logger(), *get_clock(), 2000,
         "Unsupported profile_mode %d for controller %u.",
         motor.profile_mode, motor.controller_index);
-      return;
+      return false;
   }
 
-  motor_command_pub_->publish(msg);
+  return true;
 }
 
 double XTouchNode::scale_fader(
