@@ -12,9 +12,7 @@ endif()
 
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
-find_package(std_msgs REQUIRED)
-find_package(motor_status_msgs REQUIRED)
-find_package(yaml-cpp REQUIRED)
+find_package(midi_msgs REQUIRED)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(RTMIDI REQUIRED IMPORTED_TARGET rtmidi)
@@ -28,12 +26,10 @@ target_include_directories(xtouch_node PUBLIC
 )
 ament_target_dependencies(xtouch_node
   rclcpp
-  std_msgs
-  motor_status_msgs
+  midi_msgs
 )
 target_link_libraries(xtouch_node
   PkgConfig::RTMIDI
-  yaml-cpp
 )
 target_compile_features(xtouch_node PUBLIC cxx_std_17)
 

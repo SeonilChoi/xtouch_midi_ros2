@@ -3,48 +3,30 @@
 #include <algorithm>
 #include <cctype>
 #include <functional>
-#include <map>
 #include <stdexcept>
-#include <unordered_map>
-
-#include <yaml-cpp/yaml.h>
-
-#include <std_msgs/msg/int8_multi_array.hpp>
 
 namespace
 {
 
 constexpr std::size_t kNumChannels = 8;
+constexpr uint8_t kButton0NoteStart = 0;
+constexpr uint8_t kButton1NoteStart = 8;
+constexpr uint8_t kButton2NoteStart = 16;
+constexpr uint8_t kButton3NoteStart = 24;
+constexpr uint8_t kDialCcStart = 16;
+constexpr uint8_t kDialCcEnd = kDialCcStart + kNumChannels - 1;
 constexpr uint8_t kFaderTouchNoteStart = 104;
 constexpr uint8_t kFaderTouchNoteEnd = kFaderTouchNoteStart + kNumChannels - 1;
 constexpr int32_t kFaderValueMax = 16383;
-constexpr auto kCommandPublishTick = std::chrono::milliseconds(20);
+constexpr int32_t kDialValueMax = 127;
 constexpr auto kDebounceInterval = std::chrono::milliseconds(100);
 constexpr auto kDebounceTick = std::chrono::milliseconds(50);
-constexpr std::size_t kChannelOffset = 6;
-static_assert(
-  kChannelOffset < kNumChannels,
-  "kChannelOffset must be less than kNumChannels.");
-
-constexpr uint16_t kCwNewSetPointZeroerr = 0x103F;
-constexpr uint16_t kCwNewSetPointMinas = 0x003F;
-
-constexpr double kPi = 3.14159265358979323846;
-constexpr double kRpmToRadPerSec = 2.0 * kPi / 60.0;
 
 std::string to_upper(std::string s)
 {
   std::transform(
     s.begin(), s.end(), s.begin(),
     [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
-  return s;
-}
-
-std::string to_lower(std::string s)
-{
-  std::transform(
-    s.begin(), s.end(), s.begin(),
-    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
   return s;
 }
 
@@ -57,12 +39,9 @@ bool looks_like_xtouch(const std::string & port_name)
 }
 
 template<typename T>
-T required_as(const YAML::Node & node, const char * key, const std::string & context)
+std::vector<T> to_vector(const std::array<T, kNumChannels> & values)
 {
-  if (!node[key]) {
-    throw std::runtime_error("Missing '" + std::string(key) + "' in " + context);
-  }
-  return node[key].as<T>();
+  return std::vector<T>(values.begin(), values.end());
 }
 
 }  // namespace
@@ -96,34 +75,20 @@ void XTouchNode::open_matching_port(Port & port, const char * direction)
 XTouchNode::XTouchNode(const rclcpp::NodeOptions & options)
 : rclcpp::Node("xtouch_node", options)
 {
-  const std::string config_file =
-    declare_parameter<std::string>("config_file", "");
-  const std::string command_topic =
-    declare_parameter<std::string>("command_topic", "motor_command");
-  publish_raw_topics_ = declare_parameter<bool>("publish_raw_topics", true);
+  const std::string midi_topic =
+    declare_parameter<std::string>("midi_topic", "/xtouch/midi");
+  const auto publish_period_param =
+    declare_parameter<int64_t>("publish_period_ms", 5);
+  const auto publish_period =
+    std::chrono::milliseconds(std::max<int64_t>(1, publish_period_param));
+  const int initial_dial_value = declare_parameter<int>("initial_dial_value", 0);
+  encoder_relative_mode_ = declare_parameter<bool>("encoder_relative_mode", true);
+  button_led_feedback_ = declare_parameter<bool>("button_led_feedback", true);
 
-  if (config_file.empty()) {
-    throw std::runtime_error(
-      "Parameter 'config_file' is empty. Pass a ros2_motor_manager YAML file.");
-  }
+  dial_.fill(std::clamp(initial_dial_value, 0, kDialValueMax));
 
-  motor_infos_ = load_motor_infos(config_file);
-  if (motor_infos_.empty()) {
-    throw std::runtime_error("No motor controllers were found in " + config_file);
-  }
-
-  if (publish_raw_topics_) {
-    for (std::size_t i = 0; i < kNumChannels; ++i) {
-      const std::string suffix = "ch" + std::to_string(i);
-      fader_pubs_[i] = create_publisher<std_msgs::msg::Int32>(
-        "/xtouch/fader/" + suffix, 10);
-      touch_pubs_[i] = create_publisher<std_msgs::msg::Bool>(
-        "/xtouch/touch/" + suffix, 10);
-    }
-  }
-
-  motor_command_pub_ = create_publisher<MotorStatus>(
-    command_topic, rclcpp::QoS(1).best_effort());
+  midi_pub_ = create_publisher<MidiMsg>(
+    midi_topic, rclcpp::QoS(1).best_effort());
 
   midi_in_ = std::make_unique<RtMidiIn>();
   midi_in_->ignoreTypes(true, true, true);
@@ -131,22 +96,24 @@ XTouchNode::XTouchNode(const rclcpp::NodeOptions & options)
 
   midi_out_ = std::make_unique<RtMidiOut>();
   open_matching_port(*midi_out_, "output");
+  for (uint8_t note = kButton0NoteStart;
+    note < kButton3NoteStart + kNumChannels; ++note)
+  {
+    send_button_led(note, false);
+  }
 
   midi_in_->setCallback(&XTouchNode::midi_trampoline, this);
 
-  command_tick_ = create_wall_timer(
-    kCommandPublishTick,
-    std::bind(&XTouchNode::publish_pending_motor_command, this));
+  publish_tick_ = create_wall_timer(
+    publish_period, std::bind(&XTouchNode::publish_state, this));
 
   debounce_tick_ = create_wall_timer(
     kDebounceTick, std::bind(&XTouchNode::tick_debounce, this));
 
   RCLCPP_INFO(
     get_logger(),
-    "xtouch_node ready. Loaded %zu controller(s) from '%s'; publishing "
-    "MotorStatus commands on '%s'; channel offset %zu.",
-    motor_infos_.size(), config_file.c_str(), command_topic.c_str(),
-    kChannelOffset);
+    "xtouch_node ready. Publishing full MIDI state on '%s' every %lld ms.",
+    midi_topic.c_str(), static_cast<long long>(publish_period.count()));
 }
 
 XTouchNode::~XTouchNode()
@@ -180,88 +147,66 @@ void XTouchNode::on_midi(const std::vector<unsigned char> & bytes)
   }
 
   const uint8_t status = bytes[0] & 0xF0;
-  const uint8_t channel = bytes[0] & 0x0F;
+  const uint8_t midi_channel = bytes[0] & 0x0F;
   const uint8_t d1 = bytes[1];
   const uint8_t d2 = bytes[2];
 
-  if (status == 0xE0 && channel < kNumChannels) {
+  if (status == 0xE0 && midi_channel < kNumChannels) {
     const int32_t value = static_cast<int32_t>((d2 << 7) | d1);
-    const bool controls_motor =
-      channel >= kChannelOffset &&
-      (channel - kChannelOffset) < motor_infos_.size();
-
-    if (publish_raw_topics_ && fader_pubs_[channel]) {
-      std_msgs::msg::Int32 m;
-      m.data = value;
-      fader_pubs_[channel]->publish(m);
-    }
-
     {
       std::lock_guard<std::mutex> lk(state_mutex_);
-      last_fader_value_[channel] = value;
-      fader_value_valid_[channel] = true;
-      if (controls_motor) {
-        motor_command_dirty_ = true;
-      }
-      debounce_deadline_[channel] =
+      channel_[midi_channel] = value;
+      debounce_deadline_[midi_channel] =
         std::chrono::steady_clock::now() + kDebounceInterval;
     }
-
     RCLCPP_INFO_THROTTLE(
-      get_logger(), *get_clock(), 500, "fader[%u] = %d", channel, value);
-    return;
-  }
-
-  const bool is_note_on = (status == 0x90);
-  const bool is_note_off = (status == 0x80);
-  if ((is_note_on || is_note_off) &&
-    d1 >= kFaderTouchNoteStart && d1 <= kFaderTouchNoteEnd)
-  {
-    const std::size_t ch = d1 - kFaderTouchNoteStart;
-    const bool touched = is_note_on && d2 > 0;
-
-    if (publish_raw_topics_ && touch_pubs_[ch]) {
-      std_msgs::msg::Bool m;
-      m.data = touched;
-      touch_pubs_[ch]->publish(m);
+      get_logger(), *get_clock(), 500, "fader[%u] = %d", midi_channel, value);
+  } else if (status == 0xB0 && d1 >= kDialCcStart && d1 <= kDialCcEnd) {
+    const std::size_t ch = d1 - kDialCcStart;
+    {
+      std::lock_guard<std::mutex> lk(state_mutex_);
+      if (encoder_relative_mode_) {
+        dial_[ch] = std::clamp(
+          dial_[ch] + encoder_delta(d2), int32_t{0}, kDialValueMax);
+      } else {
+        dial_[ch] = std::clamp<int32_t>(d2, 0, kDialValueMax);
+      }
     }
-
-    RCLCPP_INFO(get_logger(), "touch[%zu] = %s", ch, touched ? "down" : "up");
-    return;
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 500, "dial[%zu] = %u", ch, d2);
+  } else {
+    const bool note_event =
+      status == 0x90 || status == 0x80;
+    if (note_event) {
+      const bool pressed = status == 0x90 && d2 > 0;
+      if (d1 >= kFaderTouchNoteStart && d1 <= kFaderTouchNoteEnd) {
+        const std::size_t ch = d1 - kFaderTouchNoteStart;
+        {
+          std::lock_guard<std::mutex> lk(state_mutex_);
+          touch_[ch] = pressed;
+        }
+        RCLCPP_INFO(get_logger(), "touch[%zu] = %s", ch, pressed ? "down" : "up");
+      } else {
+        toggle_button_state(d1, pressed);
+      }
+    }
   }
 }
 
-void XTouchNode::publish_pending_motor_command()
+void XTouchNode::publish_state()
 {
-  std::array<int32_t, kNumChannels> fader_values{};
-  std::array<bool, kNumChannels> fader_value_valid{};
+  MidiMsg msg;
   {
     std::lock_guard<std::mutex> lk(state_mutex_);
-    if (!motor_command_dirty_) {
-      return;
-    }
-    fader_values = last_fader_value_;
-    fader_value_valid = fader_value_valid_;
-    motor_command_dirty_ = false;
+    msg.btn0 = to_vector(btn0_);
+    msg.btn1 = to_vector(btn1_);
+    msg.btn2 = to_vector(btn2_);
+    msg.btn3 = to_vector(btn3_);
+    msg.touch = to_vector(touch_);
+    msg.channel = to_vector(channel_);
+    msg.dial = to_vector(dial_);
   }
-
-  MotorStatus msg = make_empty_motor_status();
-  bool has_target = false;
-  const std::size_t available_channels = kNumChannels - kChannelOffset;
-  const std::size_t channel_count =
-    std::min(motor_infos_.size(), available_channels);
-  for (std::size_t channel = 0; channel < channel_count; ++channel) {
-    const std::size_t physical_channel = channel + kChannelOffset;
-    if (!fader_value_valid[physical_channel]) {
-      continue;
-    }
-    has_target = fill_motor_command_target(
-      msg, channel, fader_values[physical_channel]) || has_target;
-  }
-
-  if (has_target) {
-    motor_command_pub_->publish(msg);
-  }
+  midi_pub_->publish(msg);
 }
 
 void XTouchNode::tick_debounce()
@@ -275,7 +220,7 @@ void XTouchNode::tick_debounce()
       if (debounce_deadline_[ch].has_value() &&
         now >= *debounce_deadline_[ch])
       {
-        value = last_fader_value_[ch];
+        value = channel_[ch];
         debounce_deadline_[ch].reset();
         fire = true;
       }
@@ -288,6 +233,10 @@ void XTouchNode::tick_debounce()
 
 void XTouchNode::send_fader_pitch_bend(uint8_t ch, int32_t value)
 {
+  if (!midi_out_) {
+    return;
+  }
+
   value = std::clamp<int32_t>(value, 0, kFaderValueMax);
   std::vector<unsigned char> bytes = {
     static_cast<unsigned char>(0xE0 | (ch & 0x0F)),
@@ -304,189 +253,80 @@ void XTouchNode::send_fader_pitch_bend(uint8_t ch, int32_t value)
   }
 }
 
-std::vector<XTouchNode::MotorInfo> XTouchNode::load_motor_infos(
-  const std::string & config_file) const
+void XTouchNode::send_button_led(uint8_t note, bool on)
 {
-  YAML::Node root = YAML::LoadFile(config_file);
-  if (!root) {
-    throw std::runtime_error("Failed to load motor config: " + config_file);
+  if (!button_led_feedback_ || !midi_out_) {
+    return;
   }
 
-  const YAML::Node drivers_node = root["drivers"];
-  if (!drivers_node || !drivers_node.IsSequence()) {
-    throw std::runtime_error("Invalid or missing 'drivers' in " + config_file);
-  }
+  std::vector<unsigned char> bytes = {
+    static_cast<unsigned char>(0x90),
+    note,
+    static_cast<unsigned char>(on ? 127 : 0),
+  };
 
-  std::unordered_map<int, DriverInfo> drivers;
-  for (const auto & driver_node : drivers_node) {
-    const int id = required_as<int>(driver_node, "id", "drivers[]");
-    DriverInfo info;
-    info.id = static_cast<uint8_t>(id);
-    info.lower = required_as<double>(driver_node, "lower", "drivers[]");
-    info.upper = required_as<double>(driver_node, "upper", "drivers[]");
-    info.speed = required_as<double>(driver_node, "speed", "drivers[]");
-    info.rated_torque =
-      required_as<double>(driver_node, "rated_torque", "drivers[]");
-    info.type = to_lower(required_as<std::string>(driver_node, "type", "drivers[]"));
-    drivers.emplace(id, info);
-  }
-
-  const YAML::Node masters_node = root["masters"];
-  if (!masters_node || !masters_node.IsSequence()) {
-    throw std::runtime_error("Invalid or missing 'masters' in " + config_file);
-  }
-
-  std::map<int, MotorInfo> motors_by_index;
-  for (const auto & master_node : masters_node) {
-    const YAML::Node slaves_node = master_node["slaves"];
-    if (!slaves_node || !slaves_node.IsSequence()) {
-      throw std::runtime_error("Invalid or missing 'slaves' in masters[]");
-    }
-
-    for (const auto & slave_node : slaves_node) {
-      const int controller_index =
-        required_as<int>(slave_node, "controller_index", "slaves[]");
-      const int driver_id = required_as<int>(slave_node, "driver_id", "slaves[]");
-      const int profile_mode =
-        required_as<int>(slave_node, "profile_mode", "slaves[]");
-
-      if (controller_index < 0 || controller_index > 255) {
-        throw std::runtime_error("controller_index is out of uint8 range.");
-      }
-
-      const auto driver_iter = drivers.find(driver_id);
-      if (driver_iter == drivers.end()) {
-        throw std::runtime_error(
-          "No driver entry for driver_id " + std::to_string(driver_id));
-      }
-
-      MotorInfo info;
-      info.controller_index = static_cast<uint8_t>(controller_index);
-      info.profile_mode = static_cast<int8_t>(profile_mode);
-      info.driver = driver_iter->second;
-
-      const auto [_, inserted] = motors_by_index.emplace(controller_index, info);
-      if (!inserted) {
-        throw std::runtime_error(
-          "Duplicate controller_index " + std::to_string(controller_index));
-      }
-    }
-  }
-
-  std::vector<MotorInfo> result;
-  result.reserve(motors_by_index.size());
-  int expected_index = 0;
-  for (const auto & [controller_index, info] : motors_by_index) {
-    if (controller_index != expected_index) {
-      throw std::runtime_error(
-        "controller_index values must be dense from 0 for motor_manager.");
-    }
-    result.push_back(info);
-    ++expected_index;
-  }
-
-  return result;
-}
-
-XTouchNode::MotorStatus XTouchNode::make_empty_motor_status() const
-{
-  MotorStatus msg;
-  const std::size_t n = motor_infos_.size();
-
-  msg.number_of_target_interfaces.assign(n, 0);
-  msg.target_interface_id.resize(n);
-  msg.controller_index.resize(n);
-  msg.controlword.assign(n, 0);
-  msg.statusword.assign(n, 0);
-  msg.errorcode.assign(n, 0);
-  msg.position.assign(n, 0.0);
-  msg.velocity.assign(n, 0.0);
-  msg.torque.assign(n, 0.0);
-
-  for (std::size_t i = 0; i < n; ++i) {
-    msg.controller_index[i] = motor_infos_[i].controller_index;
-  }
-
-  return msg;
-}
-
-bool XTouchNode::fill_motor_command_target(
-  MotorStatus & msg, std::size_t channel, int32_t fader_value)
-{
-  if (channel >= motor_infos_.size()) {
-    RCLCPP_DEBUG_THROTTLE(
+  try {
+    midi_out_->sendMessage(&bytes);
+  } catch (const RtMidiError & e) {
+    RCLCPP_WARN_THROTTLE(
       get_logger(), *get_clock(), 2000,
-      "Ignoring fader channel %zu; no controller in config.", channel);
+      "MIDI LED out failed on note %u: %s", note, e.what());
+  }
+}
+
+bool XTouchNode::toggle_button_state(uint8_t note, bool pressed)
+{
+  if (!pressed) {
     return false;
   }
 
-  const MotorInfo & motor = motor_infos_[channel];
-  const std::size_t idx = motor.controller_index;
+  std::array<bool, kNumChannels> * target = nullptr;
+  std::size_t ch = 0;
 
-  if (idx >= msg.controller_index.size()) {
-    RCLCPP_WARN(
-      get_logger(), "Controller index %zu is outside MotorStatus array.", idx);
+  if (note >= kButton0NoteStart && note < kButton0NoteStart + kNumChannels) {
+    target = &btn0_;
+    ch = note - kButton0NoteStart;
+  } else if (note >= kButton1NoteStart &&
+    note < kButton1NoteStart + kNumChannels)
+  {
+    target = &btn1_;
+    ch = note - kButton1NoteStart;
+  } else if (note >= kButton2NoteStart &&
+    note < kButton2NoteStart + kNumChannels)
+  {
+    target = &btn2_;
+    ch = note - kButton2NoteStart;
+  } else if (note >= kButton3NoteStart &&
+    note < kButton3NoteStart + kNumChannels)
+  {
+    target = &btn3_;
+    ch = note - kButton3NoteStart;
+  } else {
     return false;
   }
 
-  switch (motor.profile_mode) {
-    case 0: {
-      msg.number_of_target_interfaces[idx] = 2;
-      msg.target_interface_id[idx].data = std::vector<int8_t>{0, 1};
-      msg.controlword[idx] = controlword_for_driver(motor.driver.type);
-      msg.position[idx] = scale_fader(
-        fader_value, motor.driver.lower, motor.driver.upper);
-      break;
-    }
-    case 1: {
-      msg.number_of_target_interfaces[idx] = 1;
-      msg.target_interface_id[idx].data = std::vector<int8_t>{2};
-      const double rpm = scale_fader(
-        fader_value, -motor.driver.speed, motor.driver.speed);
-      msg.velocity[idx] = rpm * kRpmToRadPerSec;
-      break;
-    }
-    case 2: {
-      msg.number_of_target_interfaces[idx] = 1;
-      msg.target_interface_id[idx].data = std::vector<int8_t>{3};
-      msg.torque[idx] = scale_fader(
-        fader_value, -motor.driver.rated_torque, motor.driver.rated_torque);
-      break;
-    }
-    default:
-      RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 2000,
-        "Unsupported profile_mode %d for controller %u.",
-        motor.profile_mode, motor.controller_index);
-      return false;
+  bool enabled = false;
+  {
+    std::lock_guard<std::mutex> lk(state_mutex_);
+    (*target)[ch] = !(*target)[ch];
+    enabled = (*target)[ch];
   }
-
+  send_button_led(note, enabled);
+  RCLCPP_INFO(
+    get_logger(), "button note %u -> ch%zu = %s",
+    note, ch, enabled ? "on" : "off");
   return true;
 }
 
-double XTouchNode::scale_fader(
-  int32_t fader_value, double lower, double upper) const
+int32_t XTouchNode::encoder_delta(uint8_t value) const
 {
-  const double normalized =
-    static_cast<double>(std::clamp<int32_t>(fader_value, 0, kFaderValueMax)) /
-    static_cast<double>(kFaderValueMax);
-  return lower + (upper - lower) * normalized;
-}
-
-uint16_t XTouchNode::controlword_for_driver(const std::string & driver_type) const
-{
-  const std::string type = to_lower(driver_type);
-  if (type == "zeroerr") {
-    return kCwNewSetPointZeroerr;
+  if (value == 0 || value == 64) {
+    return 0;
   }
-  if (type == "minas") {
-    return kCwNewSetPointMinas;
+  if (value < 64) {
+    return value;
   }
-
-  RCLCPP_WARN(
-    get_logger(), "Unknown driver type '%s'; using zeroerr set-point controlword.",
-    driver_type.c_str());
-  return kCwNewSetPointZeroerr;
+  return -static_cast<int32_t>(value - 64);
 }
 
 }  // namespace xtouch_midi
