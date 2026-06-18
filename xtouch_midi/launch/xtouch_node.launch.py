@@ -26,6 +26,16 @@ def generate_launch_description():
         default_value='true',
         description='Send MIDI note feedback to keep button LEDs in sync.',
     )
+    display_feedback_arg = DeclareLaunchArgument(
+        'display_feedback',
+        default_value='true',
+        description='Send MCU SysEx feedback to show dial values on the displays.',
+    )
+    display_device_id_arg = DeclareLaunchArgument(
+        'display_device_id',
+        default_value='21',
+        description='MCU display SysEx device id. Use 21 for Extender, 20 for main MCU.',
+    )
     initial_dial_value_arg = DeclareLaunchArgument(
         'initial_dial_value',
         default_value='0',
@@ -37,6 +47,8 @@ def generate_launch_description():
         publish_period_ms_arg,
         encoder_relative_mode_arg,
         button_led_feedback_arg,
+        display_feedback_arg,
+        display_device_id_arg,
         initial_dial_value_arg,
         Node(
             package='xtouch_midi',
@@ -56,6 +68,14 @@ def generate_launch_description():
                 'button_led_feedback': ParameterValue(
                     LaunchConfiguration('button_led_feedback'),
                     value_type=bool,
+                ),
+                'display_feedback': ParameterValue(
+                    LaunchConfiguration('display_feedback'),
+                    value_type=bool,
+                ),
+                'display_device_id': ParameterValue(
+                    LaunchConfiguration('display_device_id'),
+                    value_type=int,
                 ),
                 'initial_dial_value': ParameterValue(
                     LaunchConfiguration('initial_dial_value'),
