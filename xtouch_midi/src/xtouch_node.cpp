@@ -56,15 +56,11 @@ template<typename Port>
 void XTouchNode::open_matching_port(Port & port, const char * direction)
 {
   const unsigned int n = port.getPortCount();
-  RCLCPP_INFO(get_logger(), "Scanning %u MIDI %s port(s)...", n, direction);
 
   for (unsigned int i = 0; i < n; ++i) {
     const std::string name = port.getPortName(i);
-    RCLCPP_INFO(get_logger(), "  [%s %u] %s", direction, i, name.c_str());
     if (looks_like_xtouch(name)) {
       port.openPort(i);
-      RCLCPP_INFO(
-        get_logger(), "Connected MIDI %s port: '%s'", direction, name.c_str());
       return;
     }
   }
@@ -119,11 +115,6 @@ XTouchNode::XTouchNode(const rclcpp::NodeOptions & options)
 
   debounce_tick_ = create_wall_timer(
     kDebounceTick, std::bind(&XTouchNode::tick_debounce, this));
-
-  RCLCPP_INFO(
-    get_logger(),
-    "xtouch_node ready. Publishing full MIDI state on '%s' every %lld ms.",
-    midi_topic.c_str(), static_cast<long long>(publish_period.count()));
 }
 
 XTouchNode::~XTouchNode()
@@ -164,8 +155,6 @@ void XTouchNode::on_midi(const std::vector<unsigned char> & bytes)
   if (status == 0xE0 && midi_channel < kNumChannels) {
     const int32_t value = static_cast<int32_t>((d2 << 7) | d1);
     set_fader_value(midi_channel, value);
-    RCLCPP_INFO_THROTTLE(
-      get_logger(), *get_clock(), 500, "fader[%u] = %d", midi_channel, value);
   } else if (status == 0xB0 && d1 >= kDialCcStart && d1 <= kDialCcEnd) {
     const std::size_t ch = d1 - kDialCcStart;
     int32_t value = 0;
@@ -185,8 +174,6 @@ void XTouchNode::on_midi(const std::vector<unsigned char> & bytes)
     if (changed) {
       send_channel_dial_display(static_cast<uint8_t>(ch), value);
     }
-    RCLCPP_INFO_THROTTLE(
-      get_logger(), *get_clock(), 500, "dial[%zu] = %d", ch, value);
   } else {
     const bool note_event =
       status == 0x90 || status == 0x80;
@@ -198,7 +185,6 @@ void XTouchNode::on_midi(const std::vector<unsigned char> & bytes)
           std::lock_guard<std::mutex> lk(state_mutex_);
           touch_[ch] = pressed;
         }
-        RCLCPP_INFO(get_logger(), "touch[%zu] = %s", ch, pressed ? "down" : "up");
       } else {
         toggle_button_state(d1, pressed);
       }
@@ -210,7 +196,7 @@ void XTouchNode::set_fader_value(uint8_t ch, int32_t value)
 {
   std::lock_guard<std::mutex> lk(state_mutex_);
   channel_[ch] = std::clamp<int32_t>(value, 0, kFaderValueMax);
-  channel_seen_[ch] = true;
+  btn3_requires_fader_update_[ch] = false;
   debounce_deadline_[ch] =
     std::chrono::steady_clock::now() + kDebounceInterval;
 }
@@ -225,7 +211,7 @@ void XTouchNode::publish_state()
     msg.btn2 = to_vector(btn2_);
     msg.btn3 = to_vector(btn3_);
     for (std::size_t ch = 0; ch < msg.btn3.size(); ++ch) {
-      msg.btn3[ch] = msg.btn3[ch] && channel_seen_[ch];
+      msg.btn3[ch] = msg.btn3[ch] && !btn3_requires_fader_update_[ch];
     }
     msg.touch = to_vector(touch_);
     msg.channel = to_vector(channel_);
@@ -271,10 +257,7 @@ void XTouchNode::send_fader_pitch_bend(uint8_t ch, int32_t value)
 
   try {
     midi_out_->sendMessage(&bytes);
-  } catch (const RtMidiError & e) {
-    RCLCPP_WARN_THROTTLE(
-      get_logger(), *get_clock(), 2000,
-      "MIDI out failed on ch %u: %s", ch, e.what());
+  } catch (const RtMidiError &) {
   }
 }
 
@@ -292,10 +275,7 @@ void XTouchNode::send_button_led(uint8_t note, bool on)
 
   try {
     midi_out_->sendMessage(&bytes);
-  } catch (const RtMidiError & e) {
-    RCLCPP_WARN_THROTTLE(
-      get_logger(), *get_clock(), 2000,
-      "MIDI LED out failed on note %u: %s", note, e.what());
+  } catch (const RtMidiError &) {
   }
 }
 
@@ -322,10 +302,7 @@ void XTouchNode::send_display_text(uint8_t offset, const std::string & text)
 
   try {
     midi_out_->sendMessage(&bytes);
-  } catch (const RtMidiError & e) {
-    RCLCPP_WARN_THROTTLE(
-      get_logger(), *get_clock(), 2000,
-      "MIDI display out failed at offset %u: %s", offset, e.what());
+  } catch (const RtMidiError &) {
   }
 }
 
@@ -364,11 +341,12 @@ bool XTouchNode::toggle_button_state(uint8_t note, bool pressed)
   }
 
   std::array<bool, kNumChannels> * target = nullptr;
+  std::array<bool, kNumChannels> * requires_fader_update = nullptr;
   std::size_t ch = 0;
 
   if (note >= kButton0NoteStart && note < kButton0NoteStart + kNumChannels) {
-    send_button_led(note, false);
-    return false;
+    target = &btn0_;
+    ch = note - kButton0NoteStart;
   } else if (note >= kButton1NoteStart &&
     note < kButton1NoteStart + kNumChannels)
   {
@@ -383,6 +361,7 @@ bool XTouchNode::toggle_button_state(uint8_t note, bool pressed)
     note < kButton3NoteStart + kNumChannels)
   {
     target = &btn3_;
+    requires_fader_update = &btn3_requires_fader_update_;
     ch = note - kButton3NoteStart;
   } else {
     return false;
@@ -393,11 +372,11 @@ bool XTouchNode::toggle_button_state(uint8_t note, bool pressed)
     std::lock_guard<std::mutex> lk(state_mutex_);
     (*target)[ch] = !(*target)[ch];
     enabled = (*target)[ch];
+    if (requires_fader_update != nullptr) {
+      (*requires_fader_update)[ch] = enabled;
+    }
   }
   send_button_led(note, enabled);
-  RCLCPP_INFO(
-    get_logger(), "button note %u -> ch%zu = %s",
-    note, ch, enabled ? "on" : "off");
   return true;
 }
 
@@ -420,13 +399,10 @@ int main(int argc, char ** argv)
   try {
     auto node = std::make_shared<xtouch_midi::XTouchNode>();
     rclcpp::spin(node);
-  } catch (const RtMidiError & e) {
-    RCLCPP_FATAL(
-      rclcpp::get_logger("xtouch_node"), "RtMidi error: %s", e.what());
+  } catch (const RtMidiError &) {
     rclcpp::shutdown();
     return 2;
-  } catch (const std::exception & e) {
-    RCLCPP_FATAL(rclcpp::get_logger("xtouch_node"), "%s", e.what());
+  } catch (const std::exception &) {
     rclcpp::shutdown();
     return 1;
   }

@@ -61,7 +61,7 @@ private:
   std::array<bool, 8> btn2_{};
   std::array<bool, 8> btn3_{};
   std::array<bool, 8> touch_{};
-  std::array<bool, 8> channel_seen_{};
+  std::array<bool, 8> btn3_requires_fader_update_{};
   std::array<int32_t, 8> channel_{};
   std::array<int32_t, 8> dial_{};
   std::array<std::optional<std::chrono::steady_clock::time_point>, 8>
